@@ -2,8 +2,7 @@ name: Notify Linked Issues on Sub-PR Merge
 
 on:
   pull_request:
-    types: [closed]
-    branches: [stage]
+    types: [opened]
 
 permissions:
   issues: write
