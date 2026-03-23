@@ -46,7 +46,7 @@ jobs:
                 { owner, repo, pull_number: pr.number, per_page: 100 }
               );
               const mergePattern = /^Merge pull request #(\d+)/;
-              const squashPattern = /\(#(\d+)\)$/;
+              const squashPattern = /\(#(\d+)\)$/m;
               for (const commit of commits) {
                 const msg = commit.commit.message;
                 const mergeMatch = msg.match(mergePattern);
