@@ -2,7 +2,7 @@ name: Manage Linked Issues
 
 on:
   pull_request:
-    types: [opened, synchronize, closed]
+    types: [opened, synchronize, edited, closed]
     branches: [main, stage]
 
 permissions:
