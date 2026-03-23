@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   notify-issues:
-    if: github.event.pull_request.merged == true
+    if: github.event.action == 'opened'
     runs-on: ubuntu-latest
     steps:
       - name: Comment on linked issues
@@ -36,7 +36,7 @@ jobs:
               try {
                 await github.rest.issues.createComment({
                   owner, repo, issue_number: issueNumber,
-                  body: `🔗 Referenced in PR #${pr.number} — [${pr.title}](${pr.html_url}) (merged to \`stage\`)`,
+                  body: `Referenced in PR #${pr.number} — [${pr.title}](${pr.html_url}) (targeting \`${pr.base.ref}\`)`,
                 });
                 core.info(`Commented on issue #${issueNumber}`);
               } catch (e) {
