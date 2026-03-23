@@ -3,7 +3,7 @@ name: Manage Linked Issues
 on:
   pull_request:
     types: [opened, synchronize, closed]
-    branches: [main]
+    branches: [main, stage]
 
 permissions:
   issues: write
@@ -14,79 +14,117 @@ jobs:
     if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
-      - name: Collect and link sub-PR issues
+      - name: Collect issues and post sticky comment
         uses: actions/github-script@v7
         with:
           script: |
             const pr = context.payload.pull_request;
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+            const base = pr.base.ref;
             const issueNumbers = new Set();
-
-            // 1. Find sub-PRs from merge/squash commits
-            const commits = await github.paginate(
-              github.rest.pulls.listCommits,
-              { owner, repo, pull_number: pr.number, per_page: 100 }
-            );
-
-            const mergePattern = /^Merge pull request #(\d+)/;
-            const squashPattern = /\(#(\d+)\)$/;
-
-            const subPrNumbers = [];
-            for (const commit of commits) {
-              const msg = commit.commit.message;
-              const mergeMatch = msg.match(mergePattern);
-              const squashMatch = msg.match(squashPattern);
-              if (mergeMatch) subPrNumbers.push(parseInt(mergeMatch[1]));
-              if (squashMatch) subPrNumbers.push(parseInt(squashMatch[1]));
-            }
-
-            core.info(`Found ${subPrNumbers.length} sub-PRs: ${subPrNumbers.join(', ')}`);
-
-            // 2. Extract issue references from sub-PR bodies
             const closingKeywords = /(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)/gi;
 
-            for (const subPrNumber of subPrNumbers) {
-              try {
-                const { data: subPr } = await github.rest.pulls.get({
-                  owner, repo, pull_number: subPrNumber,
-                });
-                if (subPr.body) {
-                  let match;
-                  while ((match = closingKeywords.exec(subPr.body)) !== null) {
-                    issueNumbers.add(parseInt(match[1]));
-                  }
-                  closingKeywords.lastIndex = 0;
+            if (base === 'main') {
+              // For main PRs: find sub-PRs via timeline events
+              const timeline = await github.paginate(
+                github.rest.issues.listEventsForTimeline,
+                { owner, repo, issue_number: pr.number, per_page: 100 }
+              );
+
+              // Cross-referenced events link to sub-PRs
+              const subPrNumbers = new Set();
+              for (const event of timeline) {
+                if (event.event === 'cross-referenced' && event.source?.issue?.pull_request) {
+                  subPrNumbers.add(event.source.issue.number);
                 }
-              } catch (e) {
-                core.warning(`Could not fetch sub-PR #${subPrNumber}: ${e.message}`);
+              }
+
+              // Also check commit messages as fallback
+              const commits = await github.paginate(
+                github.rest.pulls.listCommits,
+                { owner, repo, pull_number: pr.number, per_page: 100 }
+              );
+              const mergePattern = /^Merge pull request #(\d+)/;
+              const squashPattern = /\(#(\d+)\)$/;
+              for (const commit of commits) {
+                const msg = commit.commit.message;
+                const mergeMatch = msg.match(mergePattern);
+                const squashMatch = msg.match(squashPattern);
+                if (mergeMatch) subPrNumbers.add(parseInt(mergeMatch[1]));
+                if (squashMatch) subPrNumbers.add(parseInt(squashMatch[1]));
+              }
+
+              core.info(`Found ${subPrNumbers.size} sub-PRs: ${[...subPrNumbers].join(', ')}`);
+
+              // Extract issue refs from each sub-PR body
+              for (const subPrNumber of subPrNumbers) {
+                try {
+                  const { data: subPr } = await github.rest.pulls.get({
+                    owner, repo, pull_number: subPrNumber,
+                  });
+                  if (subPr.body) {
+                    let match;
+                    while ((match = closingKeywords.exec(subPr.body)) !== null) {
+                      issueNumbers.add(parseInt(match[1]));
+                    }
+                    closingKeywords.lastIndex = 0;
+                  }
+                } catch (e) {
+                  core.warning(`Could not fetch sub-PR #${subPrNumber}: ${e.message}`);
+                }
               }
             }
 
-            core.info(`Issues found: ${[...issueNumbers].join(', ') || 'none'}`);
-
-            if (issueNumbers.size === 0) return;
-
-            // 3. Update PR body with Linked Issues section (replace if exists)
-            const issueList = [...issueNumbers].map(n => `Closes #${n}`).join('\n');
-            const section = `\n\n---\n### Linked Issues\n${issueList}`;
-            const sectionRegex = /\n\n---\n### Linked Issues\n[\s\S]*$/;
-
-            let body = pr.body || '';
-            if (sectionRegex.test(body)) {
-              body = body.replace(sectionRegex, section);
-            } else {
-              body += section;
+            // Also extract from this PR's own body
+            if (pr.body) {
+              let match;
+              while ((match = closingKeywords.exec(pr.body)) !== null) {
+                issueNumbers.add(parseInt(match[1]));
+              }
             }
 
-            await github.rest.pulls.update({
-              owner, repo, pull_number: pr.number,
-              body,
-            });
-            core.info('Updated PR body with linked issues');
+            // Guard against self-reference (PRs are issues in GitHub's API)
+            issueNumbers.delete(pr.number);
+
+            core.info(`Issues found: ${[...issueNumbers].join(', ') || 'none'}`);
+
+            const marker = '<!-- linked-issues-bot -->';
+            let body;
+
+            if (issueNumbers.size === 0) {
+              body = `${marker}\n### ⚠️ No Linked Issues\n@${pr.user.login} This PR doesn't reference any issues. Please add a closing keyword to the description (e.g. \`Closes #123\`, \`Fixes #456\`).`;
+            } else {
+              const issueList = [...issueNumbers].map(n => `- Tracks #${n}`).join('\n');
+              body = `${marker}\n### Linked Issues\n${issueList}`;
+            }
+
+            // Find existing bot comment to update
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number: pr.number, per_page: 100 }
+            );
+            const existing = comments.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id,
+                body,
+              });
+              core.info('Updated sticky comment');
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pr.number,
+                body,
+              });
+              core.info('Created sticky comment');
+            }
 
   close-issues:
-    if: github.event.action == 'closed' && github.event.pull_request.merged == true
+    if: >-
+      github.event.action == 'closed'
+      && github.event.pull_request.merged == true
+      && github.event.pull_request.base.ref == 'main'
     runs-on: ubuntu-latest
     steps:
       - name: Close linked issues
@@ -96,17 +134,29 @@ jobs:
             const pr = context.payload.pull_request;
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+            const marker = '<!-- linked-issues-bot -->';
 
-            // Parse issue numbers from the Linked Issues section
-            const closingKeywords = /(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)/gi;
-            const issueNumbers = new Set();
+            // Find the bot's sticky comment and parse issue numbers from it
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number: pr.number, per_page: 100 }
+            );
+            const botComment = comments.find(c => c.body.includes(marker));
 
-            if (pr.body) {
-              let match;
-              while ((match = closingKeywords.exec(pr.body)) !== null) {
-                issueNumbers.add(parseInt(match[1]));
-              }
+            if (!botComment) {
+              core.info('No linked-issues bot comment found');
+              return;
             }
+
+            const issuePattern = /^- Tracks #(\d+)/gm;
+            const issueNumbers = new Set();
+            let match;
+            while ((match = issuePattern.exec(botComment.body)) !== null) {
+              issueNumbers.add(parseInt(match[1]));
+            }
+
+            // Guard against self-reference
+            issueNumbers.delete(pr.number);
 
             core.info(`Issues to close: ${[...issueNumbers].join(', ') || 'none'}`);
 
